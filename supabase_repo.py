@@ -1,45 +1,59 @@
-# supabase_repo.py
+# supabase_repo.py  ←これに置き換え
+REPO_VERSION = "relaxed-keys-2025-10-30"
+
 import os
 import time
 import pandas as pd
 import streamlit as st
-from supabase import create_client
+from supabase import create_client, Client
 
-REQUIRED = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE", "BUCKET_NAME"]
+REQUIRED_BASE = ["SUPABASE_URL", "BUCKET_NAME"]
+def _get_secret(name: str):
+    try:
+        val = st.secrets.get(name)  # st.secrets が無い環境もあるので try
+    except Exception:
+        val = None
+    return val or os.getenv(name)
 
-# ★ インスタンスに紐づかないトップレベル関数に変更（selfを受けない）
+def _get_key():
+    # どちらか片方あればOK（公開はANON推奨）
+    return _get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_SERVICE_ROLE")
+
+def _assert_secrets_or_raise():
+    missing = [k for k in REQUIRED_BASE if not _get_secret(k)]
+    if not _get_key():
+        missing.append("SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE")
+    if missing:
+        # 旧版の st.error/st.stop は廃止。必ず raise にする（アプリ側で捕捉して優しく落とす）
+        raise RuntimeError("Missing secrets: " + ", ".join(missing))
+
 @st.cache_resource
-def get_supabase_client():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SERVICE_ROLE"]
-    return create_client(url, key)
+def get_supabase_client() -> Client:
+    _assert_secrets_or_raise()
+    url = _get_secret("SUPABASE_URL")
+    key = _get_key()
+    return create_client(url, key)  # type: ignore[arg-type]
 
 class Repo:
-    """Supabase接続・Storage・DB CRUDを1か所に集約。app.pyからはこれだけ使えばOK。"""
-
     def __init__(self):
-        self._assert_secrets()
-        self.bucket = st.secrets["BUCKET_NAME"]
-        # ★ ここでトップレベル関数を呼ぶ（selfを渡さない）
+        _assert_secrets_or_raise()
+        self.bucket = _get_secret("BUCKET_NAME")
         self.cli = get_supabase_client()
 
-    @staticmethod
-    def _assert_secrets():
-        missing = [k for k in REQUIRED if k not in st.secrets]
-        if missing:
-            st.error(f"secrets.toml に不足: {', '.join(missing)}")
-            st.stop()
-
-    # ---------- Storage (Public) ----------
     def upload_image_public(self, file, prefix: str) -> str | None:
         if not file:
             return None
+        import os
         ext = os.path.splitext(file.name)[1].lower() or ".png"
         path = f"{self._slug(prefix)}-{int(time.time())}{ext}"
-        self.cli.storage.from_(self.bucket).upload(path, file.read(), {"content-type": file.type})
+        data = file.read()
+        self.cli.storage.from_(self.bucket).upload(
+            path=path,
+            file=data,
+            file_options={"contentType": file.type, "upsert": True},
+        )
         return self.cli.storage.from_(self.bucket).get_public_url(path)
 
-    # ---------- DB: places ----------
     def fetch_places_df(self) -> pd.DataFrame:
         res = self.cli.table("places").select("*").execute()
         df = pd.DataFrame(res.data or [])
@@ -52,7 +66,6 @@ class Repo:
     def insert_place(self, row: dict):
         self.cli.table("places").insert(row).execute()
 
-    # ---------- DB: events ----------
     def fetch_events_df(self) -> pd.DataFrame:
         res = self.cli.table("events").select("*").execute()
         df = pd.DataFrame(res.data or [])
@@ -65,7 +78,6 @@ class Repo:
     def insert_event(self, row: dict):
         self.cli.table("events").insert(row).execute()
 
-    # ---------- util ----------
     @staticmethod
     def _slug(text: str) -> str:
         import re

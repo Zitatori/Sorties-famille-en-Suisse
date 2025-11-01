@@ -1,19 +1,38 @@
+# app.py  — 完全差し替え版
+# ポイント:
+# - set_page_config を最優先
+# - Supabaseは任意（使えれば使う）。未設定でもアプリは起動する
+# - 画像は URL / ローカルの両対応
+# - カードのHTMLを開始/終了セットに統一
+# - “今開いてる/期間中”等の判定・フィルタは既存ロジックを踏襲
+
+import streamlit as st
+st.set_page_config(page_title="Sorties famille en Suisse", page_icon="👨‍👩‍👧", layout="wide")
+
 import os
 import io
 import json
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 import pandas as pd
-import streamlit as st
 from PIL import Image
-from supabase_repo import Repo
-repo = Repo()
 
-# ========= 最優先：ページ設定 =========
-st.set_page_config(page_title="Sorties famille en Suisse", page_icon="👨‍👩‍👧", layout="wide")
+# ====== Supabase（任意） ======
+USE_SUPABASE = False
+repo = None
+try:
+    from supabase_repo import Repo
+    try:
+        repo = Repo()          # supabase_repo.py 側は “ANON or SERVICE_ROLE のどちらか”でOK化済み
+        USE_SUPABASE = True
+    except Exception as e:
+        USE_SUPABASE = False   # Secrets未設定など → ローカル保存モードへ
+except Exception:
+    USE_SUPABASE = False       # モジュール自体が無い → ローカル保存モード
 
-# ========= 定数 =========
+# ====== 定数 ======
 APP_TZ = ZoneInfo("Europe/Zurich")
 DATA_DIR = "data"
 IMG_DIR = os.path.join(DATA_DIR, "images")
@@ -21,12 +40,12 @@ PLACES_CSV = os.path.join(DATA_DIR, "places.csv")
 EVENTS_CSV = os.path.join(DATA_DIR, "events.csv")
 
 ASSETS_DIR = "assets"
-BACKGROUND_IMAGE_PATH = os.path.join(ASSETS_DIR, "bg.png")   # 任意
-HERO_IMAGE_PATH = os.path.join(ASSETS_DIR, "hero.png")       # 任意
+BACKGROUND_IMAGE_PATH = os.path.join(ASSETS_DIR, "bg.png")   # 任意（無ければ何もしない）
+HERO_IMAGE_PATH = os.path.join(ASSETS_DIR, "hero.png")       # 任意（無ければ何もしない）
 
 PARKING_OPTIONS = ["Facile", "Moyen", "Difficile"]
 WEEKDAYS_FR = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
-WEEKDAY_IDX = {name: i for i, name in enumerate(WEEKDAYS_FR)}  # 未使用だが残す
+WEEKDAY_IDX = {name: i for i, name in enumerate(WEEKDAYS_FR)}  # 予備
 
 PLACE_COLS = [
     "id", "name", "location", "rain_ok", "duration_min",
@@ -37,7 +56,7 @@ EVENT_COLS = [
     "parking", "satisfaction", "start_dt", "end_dt", "image_path", "notes"
 ]
 
-# ========= ユーティリティ =========
+# ====== ユーティリティ ======
 def ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -45,7 +64,7 @@ def ensure_dirs():
 
 def slugify(text: str) -> str:
     import re
-    text = text.strip().lower()
+    text = (text or "").strip().lower()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "-", text)
     text = re.sub(r"^-+|-+$", "", text)
@@ -59,7 +78,6 @@ def load_df(csv_path: str, cols: list) -> pd.DataFrame:
             df = pd.DataFrame(columns=cols)
     else:
         df = pd.DataFrame(columns=cols)
-    # 必須カラムを補完
     for c in cols:
         if c not in df.columns:
             df[c] = pd.Series(dtype="object")
@@ -68,20 +86,30 @@ def load_df(csv_path: str, cols: list) -> pd.DataFrame:
 def save_df(df: pd.DataFrame, csv_path: str):
     df.to_csv(csv_path, index=False)
 
-def load_image_if_exists(path: str):
-    if path and os.path.exists(path):
+def load_image_if_exists(path_or_url: Optional[str]):
+    """
+    画像ハンドルを返す:
+      - http/httpsで始まる → URL文字列をそのまま返す（st.imageに直接渡せる）
+      - ローカルパス       → PIL.Image を返す（st.imageに渡せる）
+      - 無い/読めない      → None
+    """
+    if not path_or_url:
+        return None
+    if isinstance(path_or_url, str) and path_or_url.startswith(("http://", "https://")):
+        return path_or_url
+    if os.path.exists(path_or_url):
         try:
-            return Image.open(path)
+            return Image.open(path_or_url)
         except Exception:
             return None
     return None
 
-def time_to_str(t: time | None) -> str:
+def time_to_str(t: Optional[time]) -> str:
     if t is None:
         return "-"
     return t.strftime("%H:%M")
 
-def parse_time_str(s: str | None) -> time | None:
+def parse_time_str(s: Optional[str]) -> Optional[time]:
     if not s or pd.isna(s):
         return None
     try:
@@ -93,7 +121,7 @@ def parse_time_str(s: str | None) -> time | None:
 def now_local():
     return datetime.now(APP_TZ)
 
-def is_open_today_intervals(hours_json: str, dt: datetime) -> list[tuple[time, time]]:
+def is_open_today_intervals(hours_json: Optional[str], dt: datetime) -> list[tuple[time, time]]:
     if not hours_json or pd.isna(hours_json):
         return []
     try:
@@ -112,7 +140,7 @@ def is_open_today_intervals(hours_json: str, dt: datetime) -> list[tuple[time, t
             intervals.append((start, end))
     return intervals
 
-def is_open_now(hours_json: str) -> bool:
+def is_open_now(hours_json: Optional[str]) -> bool:
     dt = now_local()
     intervals = is_open_today_intervals(hours_json, dt)
     now_t = dt.time()
@@ -121,7 +149,7 @@ def is_open_now(hours_json: str) -> bool:
             return True
     return False
 
-def within_open_now(start_dt_str: str, end_dt_str: str) -> bool:
+def within_open_now(start_dt_str: Optional[str], end_dt_str: Optional[str]) -> bool:
     if not start_dt_str or not end_dt_str:
         return False
     try:
@@ -136,7 +164,7 @@ def within_open_now(start_dt_str: str, end_dt_str: str) -> bool:
     except Exception:
         return False
 
-def display_star_rating(stars: int) -> str:
+def display_star_rating(stars: Optional[int]) -> str:
     try:
         s = int(stars)
     except Exception:
@@ -146,7 +174,7 @@ def display_star_rating(stars: int) -> str:
 
 def set_background():
     img = load_image_if_exists(BACKGROUND_IMAGE_PATH)
-    if not img:
+    if not img or isinstance(img, str):
         return
     import base64
     buf = io.BytesIO()
@@ -177,20 +205,34 @@ def set_background():
 
 def hero_header():
     hero = load_image_if_exists(HERO_IMAGE_PATH)
-    if hero:
+    if hero is not None:
         st.image(hero, use_container_width=True)
 
-
-def save_uploaded_image(upload, prefix: str) -> str | None:
+def save_uploaded_image(upload, prefix: str) -> Optional[str]:
+    """
+    画像を保存:
+      - Supabaseが使える → Storageにアップロードして“公開URL”を返す
+      - 使えない         → ローカル data/images に保存してパスを返す
+    """
     if not upload:
         return None
+
+    # Supabase優先
+    if USE_SUPABASE and repo is not None:
+        try:
+            url = repo.upload_image_public(upload, prefix=prefix)
+            if url:
+                return url  # 公開URLを保存
+        except Exception:
+            pass  # 失敗時はローカルへフォールバック
+
+    # ローカル保存
     ext = os.path.splitext(upload.name)[1].lower() or ".png"
     fname = f"{slugify(prefix)}-{int(datetime.now().timestamp())}{ext}"
     path = os.path.join(IMG_DIR, fname)
     try:
-        bytes_data = upload.read()
         with open(path, "wb") as f:
-            f.write(bytes_data)
+            f.write(upload.read())
         return path
     except Exception:
         return None
@@ -236,18 +278,18 @@ def apply_event_filters(df, q, pluie, duree, parking, satis, open_now_flag):
     return out
 
 def place_card(row):
-    open_badge = "🟢 Ouvert maintenant" if is_open_now(row["hours_json"]) else "⚪ Fermé"
-    img = load_image_if_exists(row.get("image_path"))
+    open_badge = "🟢 Ouvert maintenant" if is_open_now(row.get("hours_json")) else "⚪ Fermé"
+    img_obj = load_image_if_exists(row.get("image_path"))
     with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
         cols = st.columns([1,2])
         with cols[0]:
-            if img:
-                st.image(img, use_container_width=True)
-
-            else:
+            if img_obj is None:
                 st.write("*(Aucune image)*")
+            else:
+                st.image(img_obj, use_container_width=True)
         with cols[1]:
-            st.subheader(row["name"] or "Sans nom")
+            st.subheader(row.get("name") or "Sans nom")
             st.write(f"**Lieu :** {row.get('location','')}")
             st.write(f"**Pluie :** {'Oui' if bool(row.get('rain_ok')) else 'Non'}")
             st.write(f"**Durée :** {int(row.get('duration_min') or 0)} min")
@@ -256,15 +298,16 @@ def place_card(row):
             st.write(f"**Statut :** {open_badge}")
             if row.get("notes"):
                 st.caption(row["notes"])
-            # Horaires表示
+
+            # Horaires（詳細）
             try:
                 hours = json.loads(row.get("hours_json") or "{}")
                 parts = []
                 for d in WEEKDAYS_FR:
-                    dcfg = hours.get(d, {})
-                    if dcfg.get("open"):
-                        ivs = dcfg.get("intervals", [])
-                        iv_str = ", ".join([f'{iv["start"]}-{iv["end"]}' for iv in ivs])
+                    dc = hours.get(d, {})
+                    if dc.get("open"):
+                        ivs = dc.get("intervals", [])
+                        iv_str = ", ".join([f'{iv.get("start","")}-{iv.get("end","")}' for iv in ivs])
                     else:
                         iv_str = "Fermé"
                     parts.append(f"**{d}** {iv_str}")
@@ -275,19 +318,18 @@ def place_card(row):
         st.markdown('</div>', unsafe_allow_html=True)
 
 def event_card(row):
-    now_badge = "🟢 En cours" if within_open_now(row["start_dt"], row["end_dt"]) else "⚪ Hors créneau"
-    img = load_image_if_exists(row.get("image_path"))
+    now_badge = "🟢 En cours" if within_open_now(row.get("start_dt"), row.get("end_dt")) else "⚪ Hors créneau"
+    img_obj = load_image_if_exists(row.get("image_path"))
     with st.container():
         st.markdown('<div class="card">', unsafe_allow_html=True)
         cols = st.columns([1,2])
         with cols[0]:
-            if img:
-                st.image(img, use_container_width=True)
-
-            else:
+            if img_obj is None:
                 st.write("*(Aucune image)*")
+            else:
+                st.image(img_obj, use_container_width=True)
         with cols[1]:
-            st.subheader(row["title"] or "Événement")
+            st.subheader(row.get("title") or "Événement")
             st.write(f"**Lieu :** {row.get('location','')}")
             st.write(f"**Pluie :** {'Oui' if bool(row.get('rain_ok')) else 'Non'}")
             st.write(f"**Durée :** {int(row.get('duration_min') or 0)} min")
@@ -299,7 +341,7 @@ def event_card(row):
                 st.caption(row["notes"])
         st.markdown('</div>', unsafe_allow_html=True)
 
-def build_hours_input(default_json: str | None):
+def build_hours_input(default_json: Optional[str]):
     defaults = {}
     if default_json:
         try:
@@ -318,8 +360,8 @@ def build_hours_input(default_json: str | None):
             end_def = None
             if dc.get("intervals"):
                 try:
-                    start_def = parse_time_str(dc["intervals"][0]["start"])
-                    end_def = parse_time_str(dc["intervals"][0]["end"])
+                    start_def = parse_time_str(dc["intervals"][0].get("start"))
+                    end_def = parse_time_str(dc["intervals"][0].get("end"))
                 except Exception:
                     pass
             with c2:
@@ -345,13 +387,18 @@ def safe_rerun():
         if callable(fn2):
             fn2()
 
-# ========= メイン =========
+# ====== メイン ======
 def main():
     ensure_dirs()
     set_background()
-
     hero_header()
-    st.caption(f"Heure locale : {now_local().strftime('%Y-%m-%d %H:%M')} (Europe/Zurich)")
+
+    # ヘッダー
+    st.title("🇨🇭 Sorties famille en Suisse")
+    if USE_SUPABASE:
+        st.caption(f"Heure locale : {now_local().strftime('%Y-%m-%d %H:%M')}  •  Stockage: Supabase")
+    else:
+        st.caption(f"Heure locale : {now_local().strftime('%Y-%m-%d %H:%M')}  •  Stockage: local (CSV + images)")
 
     # データ読み込み
     places = load_df(PLACES_CSV, PLACE_COLS)
@@ -421,8 +468,6 @@ def main():
                 with c1:
                     title = st.text_input("Titre *")
                     location_e = st.text_input("Lieu (ville/région) *")
-
-                    # 日付と時間ピッカーで安全入力（テキストはやめる）
                     today = now_local().date()
                     start_date = st.date_input("Début (date) *", value=today, key="ev_sd")
                     start_time = st.time_input("Début (heure) *", value=time(9, 0), key="ev_st")
@@ -442,7 +487,6 @@ def main():
                     if not title or not location_e:
                         st.error("Titre et Lieu sont requis.")
                     else:
-                        # ISO文字列を安全生成（ローカルTZ前提）
                         start_dt = datetime.combine(start_date, start_time).replace(tzinfo=APP_TZ)
                         end_dt = datetime.combine(end_date, end_time).replace(tzinfo=APP_TZ)
                         if end_dt < start_dt:
@@ -468,9 +512,8 @@ def main():
                             safe_rerun()
 
         st.markdown("---")
-        # イベント用のフィルタはサフィックスを変えてキー衝突回避
-        q, pluie, duree, parking, satis, open_now_flag = sidebar_filters_section(suffix="_events")
-        filtered_ev = apply_event_filters(events, q, pluie, duree, parking, satis, open_now_flag)
+        q_ev, pluie_ev, duree_ev, parking_ev, satis_ev, open_now_ev = sidebar_filters_section(suffix="_events")
+        filtered_ev = apply_event_filters(events, q_ev, pluie_ev, duree_ev, parking_ev, satis_ev, open_now_ev)
         if filtered_ev.empty:
             st.info("Aucun événement correspondant.")
         else:
